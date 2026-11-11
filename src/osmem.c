@@ -16,6 +16,12 @@
 /* Blocks (header + payload) at least this big are served with mmap(). */
 #define MMAP_THRESHOLD	(128 * 1024)
 
+/* Size of the chunk reserved with brk() on the first heap allocation. */
+#define HEAP_PREALLOC	(128 * 1024)
+
+/* First block of the heap; blocks form a doubly linked list in address order. */
+static struct block_meta *heap_start;
+
 /* Header that precedes a payload returned to the user. */
 static struct block_meta *get_block(void *ptr)
 {
@@ -55,6 +61,83 @@ static void free_mapped(struct block_meta *block)
 	DIE(ret == -1, "munmap");
 }
 
+/* Move the program break up by @increment bytes; returns the old break. */
+static void *heap_grow(size_t increment)
+{
+	void *old_brk = sbrk(increment);
+
+	DIE(old_brk == (void *)-1, "sbrk");
+
+	return old_brk;
+}
+
+/*
+ * Reserve HEAP_PREALLOC bytes on the first heap use, so that later small
+ * allocations do not need a brk() call each. The whole chunk becomes a
+ * single free block.
+ */
+static void heap_preallocate(void)
+{
+	heap_start = heap_grow(HEAP_PREALLOC);
+	heap_start->size = HEAP_PREALLOC - META_SIZE;
+	heap_start->status = STATUS_FREE;
+	heap_start->prev = NULL;
+	heap_start->next = NULL;
+}
+
+static struct block_meta *heap_last(void)
+{
+	struct block_meta *block = heap_start;
+
+	while (block && block->next)
+		block = block->next;
+
+	return block;
+}
+
+/* First free heap block that can hold @size bytes, or NULL. */
+static struct block_meta *find_free_block(size_t size)
+{
+	struct block_meta *block;
+
+	for (block = heap_start; block; block = block->next)
+		if (block->status == STATUS_FREE && block->size >= size)
+			return block;
+
+	return NULL;
+}
+
+/* Add a new block of @size bytes at the end of the heap. */
+static struct block_meta *heap_append(size_t size)
+{
+	struct block_meta *last = heap_last();
+	struct block_meta *block = heap_grow(META_SIZE + size);
+
+	block->size = size;
+	block->status = STATUS_ALLOC;
+	block->prev = last;
+	block->next = NULL;
+	last->next = block;
+
+	return block;
+}
+
+static struct block_meta *alloc_heap(size_t size)
+{
+	struct block_meta *block;
+
+	if (!heap_start)
+		heap_preallocate();
+
+	block = find_free_block(size);
+	if (block) {
+		block->status = STATUS_ALLOC;
+		return block;
+	}
+
+	return heap_append(size);
+}
+
 void *os_malloc(size_t size)
 {
 	if (size == 0)
@@ -65,8 +148,7 @@ void *os_malloc(size_t size)
 	if (META_SIZE + size >= MMAP_THRESHOLD)
 		return get_payload(alloc_mapped(size));
 
-	/* TODO: small allocations on the heap with brk() */
-	return NULL;
+	return get_payload(alloc_heap(size));
 }
 
 void os_free(void *ptr)
@@ -80,8 +162,9 @@ void os_free(void *ptr)
 
 	if (block->status == STATUS_MAPPED)
 		free_mapped(block);
-
-	/* TODO: release heap blocks */
+	else if (block->status == STATUS_ALLOC)
+		/* Heap memory is kept for reuse; the break is never lowered. */
+		block->status = STATUS_FREE;
 }
 
 void *os_calloc(size_t nmemb, size_t size)
